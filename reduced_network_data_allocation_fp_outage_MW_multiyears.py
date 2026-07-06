@@ -3,6 +3,8 @@
 Revised v2: reorder loops for efficiency while preserving behavior.
 - All outputs still go to Data/data_allocation with the same filenames as v1.
 - Only loop order and where computations occur were adjusted to avoid redundant work.
+- Outage processing now aggregates raw/pre-reduction generator available-capacity files
+  into reduced-network HorizonGenLimits_base and HorizonMustrunLimits_base files.
 """
 
 import pandas as pd
@@ -27,19 +29,28 @@ def _save_csv(df: pd.DataFrame, filename: str, index: bool = False):
     df.to_csv(full, index=index)
     return full
 
-def _lostcap_src_for_year(base_dir: str, year) -> str:
-    """
-    Find the year-specific lost capacity file.
+def _normalize_bus_id(x):
+    """Normalize bus ids so 123, 123.0, and '123' compare consistently."""
+    try:
+        f = float(x)
+        if f.is_integer():
+            return int(f)
+    except Exception:
+        pass
+    return str(x)
 
-    Expected names:
-        Data/Gen/east2016_lostcap_v4.csv
-        Data/Gen/east2016_lostcap_v4
-    """
-    y = str(year)
 
+def _raw_outage_metadata_src(base_dir: str) -> str:
+    """
+    Find raw/pre-reduction generator metadata created by GadsOutagesEAST.py.
+
+    Expected file from the adjusted GadsOutagesEAST workflow:
+        east_rawGens_metadata.csv
+    """
     candidates = [
-        os.path.join(base_dir, 'Gen', f'east{y}_lostcap_v4.csv'),
-        os.path.join(base_dir, 'Gen', f'east{y}_lostcap_v4'),
+        os.path.join(base_dir, 'Gen', 'east_rawGens_metadata.csv'),
+        os.path.join(base_dir, 'data_allocation', 'east_rawGens_metadata.csv'),
+        'east_rawGens_metadata.csv',
     ]
 
     for p in candidates:
@@ -47,9 +58,398 @@ def _lostcap_src_for_year(base_dir: str, year) -> str:
             return p
 
     raise FileNotFoundError(
-        f"Could not find lost-cap file for year {y}. Checked:\n" +
+        "Could not find east_rawGens_metadata.csv. Checked:\n" + "\n".join(candidates)
+    )
+
+
+def _raw_available_cap_src_for_year(base_dir: str, year) -> str:
+    """
+    Find raw/pre-reduction hourly generator available-capacity file.
+
+    Expected file from the adjusted GadsOutagesEAST workflow:
+        east2019_rawGensAvailableCap.csv
+    """
+    y = str(year)
+    candidates = [
+        os.path.join(base_dir, 'Gen', f'east{y}_rawGensAvailableCap.csv'),
+        os.path.join(base_dir, 'data_allocation', f'east{y}_rawGensAvailableCap.csv'),
+        f'east{y}_rawGensAvailableCap.csv',
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    raise FileNotFoundError(
+        f"Could not find raw generator available-capacity file for year {y}. Checked:\n" +
         "\n".join(candidates)
     )
+
+
+def _read_hourly_wide_file(path: str):
+    """
+    Read an 8760-row wide hourly file.
+
+    If the first column is Time/Hour/Hour_of_Year/Unnamed, use it as the hour column;
+    otherwise create a 1..8760 hour index.
+    """
+    df = pd.read_csv(path, header=0)
+    if len(df) != 8760:
+        raise ValueError(f"{path} has {len(df)} rows; expected 8760.")
+
+    first_col = str(df.columns[0])
+    first_lower = first_col.lower()
+    if first_lower.startswith('unnamed') or first_lower in {'time', 'hour', 'hour_of_year'}:
+        default_hours = pd.Series(np.arange(1, len(df) + 1), index=df.index)
+        hours = pd.to_numeric(df[first_col], errors='coerce').fillna(default_hours)
+        values = df.drop(columns=[first_col]).copy()
+    else:
+        hours = pd.Series(np.arange(1, len(df) + 1), index=df.index, name='Hour')
+        values = df.copy()
+
+    # Normalize generator column names to strings so they match Raw_Output_Name
+    # values from east_rawGens_metadata.csv.
+    values.columns = values.columns.astype(str)
+    values = values.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    return pd.Series(hours, name='Hour'), values
+
+
+def _validate_raw_metadata_and_available(
+    *,
+    raw_meta: pd.DataFrame,
+    raw_available: pd.DataFrame,
+    raw_metadata_path: str,
+    raw_available_path: str,
+    year: str,
+) -> dict:
+    """
+    Validate that the GADS metadata and raw available-capacity file are aligned.
+
+    After switching to the ERCOT-style row-level GADS allocation, the expected
+    relationship is one metadata row per raw thermal generator and one hourly
+    available-capacity column per Raw_Output_Name.  Missing source columns should
+    be treated as a data error, not as zero capacity/lost capacity.
+    """
+    meta_names = raw_meta['Raw_Output_Name'].astype(str).tolist()
+    available_cols = [str(c) for c in raw_available.columns]
+
+    duplicate_meta_names = sorted(raw_meta.loc[
+        raw_meta['Raw_Output_Name'].astype(str).duplicated(),
+        'Raw_Output_Name'
+    ].astype(str).unique().tolist())
+    if duplicate_meta_names:
+        raise ValueError(
+            f"{raw_metadata_path} has duplicated Raw_Output_Name values. "
+            f"Examples: {duplicate_meta_names[:10]}"
+        )
+
+    duplicate_available_cols = sorted(pd.Series(available_cols).loc[
+        pd.Series(available_cols).duplicated()
+    ].astype(str).unique().tolist())
+    if duplicate_available_cols:
+        raise ValueError(
+            f"{raw_available_path} has duplicated generator columns after reading. "
+            f"Examples: {duplicate_available_cols[:10]}"
+        )
+
+    if 'SourceRowCount' in raw_meta.columns:
+        source_row_count = pd.to_numeric(raw_meta['SourceRowCount'], errors='coerce')
+        bad_source_rows = raw_meta.loc[source_row_count.ne(1)]
+        if len(bad_source_rows) > 0:
+            examples = bad_source_rows[[
+                'Raw_Output_Name', 'RawBusNum', 'PlantNames', 'Fuel', 'SourceRowCount'
+            ]].head(10).to_dict('records')
+            raise ValueError(
+                f"{raw_metadata_path} appears to contain grouped metadata rows, not "
+                f"ERCOT-style raw thermal rows. SourceRowCount != 1 for "
+                f"{len(bad_source_rows)} rows. Examples: {examples}"
+            )
+
+    meta_set = set(meta_names)
+    available_set = set(available_cols)
+    missing_available_cols = sorted(meta_set - available_set)
+    extra_available_cols = sorted(available_set - meta_set)
+
+    if missing_available_cols or extra_available_cols:
+        # Save a small diagnostic before failing, when possible.
+        diag_rows = []
+        diag_rows.extend({
+            'Issue': 'metadata Raw_Output_Name missing from raw available-capacity file',
+            'Name': name,
+        } for name in missing_available_cols[:5000])
+        diag_rows.extend({
+            'Issue': 'raw available-capacity column not found in metadata',
+            'Name': name,
+        } for name in extra_available_cols[:5000])
+        if diag_rows:
+            diag = pd.DataFrame(diag_rows)
+            fn_diag = f'raw_available_metadata_name_mismatch_y_{year}.csv'
+            _save_csv(diag, fn_diag, index=False)
+
+        raise ValueError(
+            f"Raw metadata and available-capacity file are not aligned for year {year}. "
+            f"metadata rows={len(raw_meta)}, available columns={len(available_cols)}, "
+            f"missing available columns={len(missing_available_cols)}, "
+            f"extra available columns={len(extra_available_cols)}. "
+            f"See raw_available_metadata_name_mismatch_y_{year}.csv for examples."
+        )
+
+    summary = {
+        'Year': year,
+        'Metadata_Path': raw_metadata_path,
+        'Raw_Available_Path': raw_available_path,
+        'Metadata_Rows': int(len(raw_meta)),
+        'Unique_Raw_Output_Name': int(len(meta_set)),
+        'Raw_Available_Columns': int(len(available_cols)),
+        'Missing_Available_Columns': int(len(missing_available_cols)),
+        'Extra_Available_Columns': int(len(extra_available_cols)),
+        'Row_Level_Metadata': bool('SourceRowCount' not in raw_meta.columns or (pd.to_numeric(raw_meta['SourceRowCount'], errors='coerce') == 1).all()),
+    }
+    return summary
+
+
+def _aggregate_raw_available_capacity_to_reduced_limits(
+    *,
+    NN,
+    year: str,
+    raw_metadata_path: str,
+    raw_available_path: str,
+    df_reduced_thermal_map: pd.DataFrame,
+    final_genparams_path: str,
+    all_buses,
+    raw_to_reduced_bus: dict,
+):
+    """
+    Convert raw/pre-reduction generator available capacity to model-ready limits.
+
+    Input from GadsOutagesEAST:
+        east_rawGens_metadata.csv
+        east{year}_rawGensAvailableCap.csv
+
+    Outputs to Data/data_allocation:
+        HorizonGenLimits_base_{NN}_y_{year}.csv
+        HorizonMustrunLimits_base_{NN}_y_{year}.csv
+        raw_to_reduced_outage_map_{NN}_y_{year}.csv
+        raw_to_reduced_outage_unmapped_{NN}_y_{year}.csv
+
+    Notes:
+      - Coal and gas keep plant-level reduced generator names.
+      - Oil is aggregated to final node-level oil generators, e.g. bus_123_oil.
+      - Nuclear is aggregated to bus-level must-run capacity, e.g. bus_123.
+    """
+    raw_meta = pd.read_csv(raw_metadata_path, header=0)
+    hours, raw_available = _read_hourly_wide_file(raw_available_path)
+    final_genparams = pd.read_csv(final_genparams_path, header=0)
+
+    required_meta_cols = {'Raw_Output_Name', 'RawBusNum', 'PlantNames', 'Fuel', 'Max_Cap'}
+    missing_meta = required_meta_cols - set(raw_meta.columns)
+    if missing_meta:
+        raise ValueError(
+            f"{raw_metadata_path} is missing required columns: {sorted(missing_meta)}"
+        )
+
+    consistency_summary = _validate_raw_metadata_and_available(
+        raw_meta=raw_meta,
+        raw_available=raw_available,
+        raw_metadata_path=raw_metadata_path,
+        raw_available_path=raw_available_path,
+        year=str(year),
+    )
+    full_consistency = _save_csv(
+        pd.DataFrame([consistency_summary]),
+        f'raw_available_metadata_consistency_{NN}_y_{year}.csv',
+        index=False,
+    )
+
+    # Final model outage generators are the dispatchable thermal generators in EIC_simple.py.
+    model_outage_gens = final_genparams.loc[
+        final_genparams['typ'].isin(['coal', 'ngcc', 'ngct', 'oil']),
+        'name'
+    ].astype(str).tolist()
+
+    # Model buses for must-run limits. Use all reduced-network buses, including non-nuclear buses.
+    bus_cols = [f'bus_{_normalize_bus_id(b)}' for b in all_buses]
+
+    gen_limits = pd.DataFrame(0.0, index=raw_available.index, columns=model_outage_gens)
+    mustrun_limits = pd.DataFrame(0.0, index=raw_available.index, columns=bus_cols)
+
+    # Lookup from reduced pre-oil thermal groups to their reduced generator name.
+    # df_reduced_thermal_map is created in the same order as thermal_gens_{NN}.csv.
+    reduced_lookup = {}
+    for _, row in df_reduced_thermal_map.iterrows():
+        key = (
+            _normalize_bus_id(row['Bus']),
+            str(row['BasePlantName']),
+            str(row['Fuel']),
+        )
+        reduced_lookup[key] = str(row['Name'])
+
+    model_gen_set = set(model_outage_gens)
+    mustrun_bus_set = set(bus_cols)
+    raw_available_cols = set(str(c) for c in raw_available.columns)
+
+    map_records = []
+    unmapped_records = []
+
+    for _, row in raw_meta.iterrows():
+        raw_name = str(row['Raw_Output_Name'])
+        raw_bus = _normalize_bus_id(row['RawBusNum'])
+        new_bus = raw_to_reduced_bus.get(raw_bus, raw_bus)
+        plant_name = str(row['PlantNames'])
+        fuel = str(row['Fuel'])
+        max_cap = float(row['Max_Cap'])
+
+        if raw_name not in raw_available_cols:
+            unmapped_records.append({
+                'Raw_Output_Name': raw_name,
+                'RawBusNum': raw_bus,
+                'NewBusNum': new_bus,
+                'PlantNames': plant_name,
+                'Fuel': fuel,
+                'Reason': 'raw available-capacity column not found',
+            })
+            continue
+
+        target_type = None
+        target_name = None
+        reason = 'mapped'
+
+        if fuel == 'NUC (Nuclear)':
+            target_type = 'mustrun_bus'
+            target_name = f'bus_{new_bus}'
+            if target_name not in mustrun_bus_set:
+                reason = 'reduced nuclear bus not in model bus set'
+                target_name = None
+        elif fuel == 'DFO (Distillate Fuel Oil)':
+            target_type = 'oil_node'
+            target_name = f'bus_{new_bus}_oil'
+            if target_name not in model_gen_set:
+                reason = 'final node-level oil generator not found'
+                target_name = None
+        elif fuel in {'NG (Natural Gas)', 'BIT (Bituminous Coal)'}:
+            target_type = 'thermal_generator'
+            target_name = reduced_lookup.get((new_bus, plant_name, fuel))
+            if target_name is None:
+                reason = 'reduced thermal generator group not found'
+            elif target_name not in model_gen_set:
+                reason = 'reduced thermal generator not in final model outage set'
+                target_name = None
+        else:
+            reason = 'fuel not represented in outage/mustrun model'
+
+        if target_name is None:
+            unmapped_records.append({
+                'Raw_Output_Name': raw_name,
+                'RawBusNum': raw_bus,
+                'NewBusNum': new_bus,
+                'PlantNames': plant_name,
+                'Fuel': fuel,
+                'Reason': reason,
+            })
+            continue
+
+        if target_type == 'mustrun_bus':
+            mustrun_limits[target_name] += raw_available[raw_name]
+        else:
+            gen_limits[target_name] += raw_available[raw_name]
+
+        map_records.append({
+            'Raw_Output_Name': raw_name,
+            'RawBusNum': raw_bus,
+            'NewBusNum': new_bus,
+            'PlantNames': plant_name,
+            'Fuel': fuel,
+            'Raw_Max_Cap': max_cap,
+            'SourceRowCount': row.get('SourceRowCount', 1),
+            'RawRowID': row.get('RawRowID', row.get('SourceRawRowIDs', '')),
+            'Target_Type': target_type,
+            'Target_Name': target_name,
+        })
+
+    # Clip generator limits to final model maxcap to protect against any duplicate aggregation.
+    final_cap = final_genparams.set_index('name')['maxcap'].apply(pd.to_numeric, errors='coerce')
+    final_cap = final_cap.reindex(model_outage_gens).fillna(np.inf)
+    gen_limits = gen_limits.clip(lower=0.0, upper=final_cap, axis=1)
+
+    # The raw available-capacity series is already capped by raw generator MWMax. Keep only nonnegative values.
+    mustrun_limits = mustrun_limits.clip(lower=0.0)
+
+    # Write model-ready hourly limit files.
+    gen_limits_out = gen_limits.copy()
+    gen_limits_out.insert(0, 'Hour', hours.values)
+    mustrun_limits_out = mustrun_limits.copy()
+    mustrun_limits_out.insert(0, 'Hour', hours.values)
+
+    fn_gen_limits = f'HorizonGenLimits_base_{NN}_y_{year}.csv'
+    fn_mustrun_limits = f'HorizonMustrunLimits_base_{NN}_y_{year}.csv'
+    full_gen_limits = _save_csv(gen_limits_out, fn_gen_limits, index=False)
+    full_mustrun_limits = _save_csv(mustrun_limits_out, fn_mustrun_limits, index=False)
+
+    # Also save standardized copies of raw inputs for traceability.
+    raw_meta_copy = os.path.join(data_allocation_dir, 'east_rawGens_metadata.csv')
+    raw_avail_copy = os.path.join(data_allocation_dir, f'east{year}_rawGensAvailableCap.csv')
+    if os.path.abspath(raw_metadata_path) != os.path.abspath(raw_meta_copy):
+        copy(raw_metadata_path, raw_meta_copy)
+    if os.path.abspath(raw_available_path) != os.path.abspath(raw_avail_copy):
+        copy(raw_available_path, raw_avail_copy)
+
+    map_df = pd.DataFrame(map_records)
+    unmapped_df = pd.DataFrame(unmapped_records)
+
+    # Strict model-coverage check: every final outage generator in EIC_simple.py
+    # should receive at least one raw generator group. Otherwise its hourly limit
+    # would remain zero for the full year, which would silently remove capacity.
+    mapped_model_targets = set()
+    if not map_df.empty and 'Target_Name' in map_df.columns:
+        mapped_model_targets = set(
+            map_df.loc[map_df['Target_Type'].isin(['thermal_generator', 'oil_node']), 'Target_Name']
+            .astype(str)
+            .tolist()
+        )
+    missing_model_gens = sorted(set(model_outage_gens) - mapped_model_targets)
+    missing_model_gens_df = pd.DataFrame({'missing_model_outage_generator': missing_model_gens})
+
+    fn_map = f'raw_to_reduced_outage_map_{NN}_y_{year}.csv'
+    fn_unmapped = f'raw_to_reduced_outage_unmapped_{NN}_y_{year}.csv'
+    fn_missing_model = f'raw_to_reduced_outage_missing_model_gens_{NN}_y_{year}.csv'
+    full_map = _save_csv(map_df, fn_map, index=False)
+    full_unmapped = _save_csv(unmapped_df, fn_unmapped, index=False)
+    full_missing_model = _save_csv(missing_model_gens_df, fn_missing_model, index=False)
+
+    print('\n========== Raw-to-reduced outage aggregation diagnostic ==========' )
+    print(f'Year: {year}')
+    print(f"Raw metadata rows: {consistency_summary['Metadata_Rows']}")
+    print(f"Unique Raw_Output_Name values: {consistency_summary['Unique_Raw_Output_Name']}")
+    print(f'Raw available-capacity columns: {len(raw_available.columns)}')
+    print(f'Saved metadata/available consistency check: {full_consistency}')
+    print(f'Mapped raw generator rows: {len(map_df)}')
+    print(f'Unmapped raw generator rows: {len(unmapped_df)}')
+    print(f'Model outage generators: {len(model_outage_gens)}')
+    print(f'Model buses in must-run limit file: {len(bus_cols)}')
+    print(f'Saved: {full_gen_limits}')
+    print(f'Saved: {full_mustrun_limits}')
+    print(f'Saved mapping: {full_map}')
+    if len(unmapped_df) > 0:
+        print(f'Saved unmapped records: {full_unmapped}')
+        print('Examples of unmapped records:')
+        print(unmapped_df.head(10).to_string(index=False))
+
+    if missing_model_gens:
+        print(f'Saved missing model-generator records: {full_missing_model}')
+        print('Examples of missing model outage generators:')
+        print(missing_model_gens_df.head(10).to_string(index=False))
+        raise ValueError(
+            f"{len(missing_model_gens)} final model outage generators did not receive "
+            f"any raw available-capacity mapping. See {full_missing_model}."
+        )
+
+    return {
+        'gen_limits_path': full_gen_limits,
+        'mustrun_limits_path': full_mustrun_limits,
+        'mapping_path': full_map,
+        'unmapped_path': full_unmapped,
+        'missing_model_gens_path': full_missing_model,
+    }
 
 # Static references
 #df_load = pd.read_csv('BA_load_corrected.csv',header=0, index_col=0)
@@ -149,6 +549,14 @@ for NN in NODE_NUMBER:
         OB = df_gens.loc[i,'BusNum']
         NB.append(new_bus_num[old_bus_num.index(OB)] if OB in old_bus_num else OB)
     df_gens['NewBusNum'] = NB
+
+    # Raw BusNum -> reduced NewBusNum map used later to aggregate raw outage-adjusted
+    # available capacity into the reduced-network model generators.
+    raw_to_reduced_bus = {
+        _normalize_bus_id(row.BusNum): _normalize_bus_id(row.NewBusNum)
+        for row in df_gens[['BusNum', 'NewBusNum']].drop_duplicates().itertuples(index=False)
+    }
+
     for i in range(0,len(df_gens_heat_rate)):
         OB = df_gens_heat_rate.loc[i,'BusNum']
         NB_hr.append(new_bus_num[old_bus_num.index(OB)] if OB in old_bus_num else OB)
@@ -162,11 +570,13 @@ for NN in NODE_NUMBER:
     bus_area_hr = list(df_gens_heat_rate['AreaName'])
 
     # sanitize names
-    for n_ in names:
-        i = names.index(n_)
-        corrected = re.sub(r'[^A-Z]',r'',n_)
+    # IMPORTANT: use enumerate rather than names.index(n_). BusName can repeat;
+    # list.index() would always return the first duplicate and corrupt PlantNames
+    # for later duplicate rows, which then breaks outage/available-capacity mapping.
+    for i, n_ in enumerate(names):
+        corrected = re.sub(r'[^A-Z]', r'', str(n_))
         f = fts[i]
-        bn = bus_area[i].replace(" ", "_")
+        bn = str(bus_area[i]).replace(" ", "_")
         if f == 'NUC (Nuclear)': f = 'Nuc'
         elif f == 'NG (Natural Gas)': f = 'NG'
         elif f == 'BIT (Bituminous Coal)': f = 'C'
@@ -175,11 +585,10 @@ for NN in NODE_NUMBER:
         elif f == 'WND (Wind)': f = 'W'
         elif f == 'DFO (Distillate Fuel Oil)': f = 'O'
         names[i] = corrected + '_' + f + '_' + bn
-    for n_ in names_hr:
-        i = names_hr.index(n_)
-        corrected = re.sub(r'[^A-Z]',r'',n_)
+    for i, n_ in enumerate(names_hr):
+        corrected = re.sub(r'[^A-Z]', r'', str(n_))
         f = fts_hr[i]
-        bn = bus_area_hr[i].replace(" ", "_")
+        bn = str(bus_area_hr[i]).replace(" ", "_")
         if f == 'NUC (Nuclear)': f = 'Nuc'
         elif f == 'NG (Natural Gas)': f = 'NG'
         elif f == 'BIT (Bituminous Coal)': f = 'C'
@@ -193,7 +602,7 @@ for NN in NODE_NUMBER:
     df_gens_heat_rate['PlantNames'] = names_hr
 
     NB_unique = df_gens['NewBusNum'].unique()
-    plants, caps, mw_min, nbs, heat_rate, f = [], [], [], [], [], []
+    plants, plant_bases, caps, mw_min, nbs, heat_rate, f = [], [], [], [], [], [], []
     count = 2
     thermal = ['NG (Natural Gas)','NUC (Nuclear)','BIT (Bituminous Coal)','DFO (Distillate Fuel Oil)']
 
@@ -208,6 +617,7 @@ for NN in NODE_NUMBER:
                 if hr == np.nan or hr == 0 or hr == 'nan' or hr == '':
                     hr = np.nanmean(df_gens.loc[df_gens['FuelType']==fuel[0],'Heat Rate MBTU/MWh'].values)
                 mn = sum(sample.loc[sample['PlantNames']==s,'MWMin'].values)
+                plant_bases.append(s)
                 mw_min.append(mn)
                 caps.append(c)
                 nbs.append(n_)
@@ -222,6 +632,14 @@ for NN in NODE_NUMBER:
     df_C = pd.DataFrame(C, columns=['Name','Bus','Fuel','Max_Cap','Min_Cap','Heat_Rate'])
     fn_thermal = f'thermal_gens_{NN}.csv'
     full_thermal_path = _save_csv(df_C, fn_thermal, index=False)
+
+    # Keep a reduced thermal mapping table with the unsuffixed plant name.
+    # This table is used to aggregate raw/pre-reduction outage-adjusted capacity
+    # to the reduced-network generator names without relying on one-to-one matches.
+    df_reduced_thermal_map = df_C.copy()
+    df_reduced_thermal_map['BasePlantName'] = plant_bases
+    fn_thermal_map = f'thermal_gens_mapping_{NN}.csv'
+    full_thermal_map_path = _save_csv(df_reduced_thermal_map, fn_thermal_map, index=False)
 
 
 # =============================================================================
@@ -354,8 +772,13 @@ for NN in NODE_NUMBER:
         if 'SUN (Solar)' in fuels_here:
             has_solar[b] = True
 
+    # Outage-adjusted capacity limits are NN/year-specific and do not depend on
+    # transmission expansion cases. Track completed NN/year pairs so we do not
+    # repeatedly regenerate identical files inside the ΔMW loop.
+    outage_limits_by_year = {}
+
     # ==========================
-    # TRANSMISSION (NN, Tp)
+    # TRANSMISSION (NN, ΔMW)
     # ==========================
     for ΔMW in trans_MW:
         # Create Exp folder once per NN/UC/Tp/year/section later; but transmission matrices do not depend on year/section.
@@ -1078,18 +1501,36 @@ for NN in NODE_NUMBER:
                     copy(milp,path)
                     copy(lp,path)
 
-                # Generator outages & loss dict
-                loss_src = _lostcap_src_for_year(base_dir, y_string)
-                
-                # Save to a standardized year-specific name in Data/data_allocation
-                loss_dst = os.path.join(data_allocation_dir, f'east{y_string}_lostcap_v4.csv')
-                copy(loss_src, loss_dst)
-                
-                print(f"Copied lost-cap file for year {y_string}: {loss_src} -> {loss_dst}")
-                
-                from dict_creator import dict_funct
-                df_loss_dict = dict_funct(df)
-                
-                npy_path = os.path.join(data_allocation_dir, f'df_dict2_{NN}.npy')
-                np.save(npy_path, df_loss_dict)
-                #copy(npy_path, path)
+                # -----------------
+                # YEAR-SPECIFIC RAW-TO-REDUCED OUTAGE-ADJUSTED CAPACITY
+                # -----------------
+                # GadsOutagesEAST now produces raw/pre-reduction available capacity:
+                #     east_rawGens_metadata.csv
+                #     east{year}_rawGensAvailableCap.csv
+                # Here we aggregate those raw generator limits into the final reduced-network
+                # model structure used by EIC_simple.py. These limits do not depend on ΔMW.
+
+                outage_key = (str(NN), y_string)
+                if outage_key not in outage_limits_by_year:
+                    raw_metadata_src = _raw_outage_metadata_src(base_dir)
+                    raw_available_src = _raw_available_cap_src_for_year(base_dir, y_string)
+
+                    outage_limit_outputs = _aggregate_raw_available_capacity_to_reduced_limits(
+                        NN=NN,
+                        year=y_string,
+                        raw_metadata_path=raw_metadata_src,
+                        raw_available_path=raw_available_src,
+                        df_reduced_thermal_map=df_reduced_thermal_map,
+                        final_genparams_path=full_genparams_path,
+                        all_buses=buses_reduced,
+                        raw_to_reduced_bus=raw_to_reduced_bus,
+                    )
+                    outage_limits_by_year[outage_key] = outage_limit_outputs
+                else:
+                    outage_limit_outputs = outage_limits_by_year[outage_key]
+                    print(
+                        f"Reusing base outage-adjusted capacity limits for NN={NN}, year={y_string}; "
+                        f"these limits are independent of ΔMW={ΔMW}."
+                    )
+                    print(f"  HorizonGenLimits:     {outage_limit_outputs['gen_limits_path']}")
+                    print(f"  HorizonMustrunLimits: {outage_limit_outputs['mustrun_limits_path']}")

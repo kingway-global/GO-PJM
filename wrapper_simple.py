@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jun 20 22:14:07 2017
+wrapper_simple.py for the PJM/EIC simple DCOPF workflow.
 
-@author: YSu
+Adjusted for the raw-generator outage-capacity workflow:
+- EICDataSetup is expected to load HorizonGenLimits_base_{NN}_y_{YEAR}.csv
+  and HorizonMustrunLimits_base_{NN}_y_{YEAR}.csv into EIC_data.dat as
+  SimGenLimit and SimMustrunLimit.
+- This wrapper only transfers those already outage-adjusted annual limits
+  into the 24-hour horizon parameters.
+- It does not read east*_lostcap_v4.csv, does not load df_dict2_*.npy, and
+  does not subtract GADS category lost-capacity values a second time.
 """
 
 from pyomo.opt import SolverFactory
@@ -71,6 +78,20 @@ D = 2
 K=range(1,H+1)
 
 
+def _safe_get_param(param_obj, key, default=0.0):
+    """Safely read a Pyomo indexed parameter, returning default when missing."""
+    try:
+        if key in param_obj:
+            return pyo.value(param_obj[key])
+    except Exception:
+        pass
+    try:
+        return pyo.value(param_obj[key])
+    except Exception:
+        return default
+
+
+
 #Space to store results
 mwh=[]
 on=[]
@@ -128,43 +149,30 @@ YEAR = _infer_year_from_exp_folder(folder)
 
 df_generators = pd.read_csv(os.path.join(data_allocation_dir, f'data_genparams_{NN}.csv'), header=0)
 
-#Outage
-df_thermal = pd.read_csv(os.path.join(data_allocation_dir, f'thermal_gens_{NN}.csv'), header=0)
-nucs = df_thermal[df_thermal['Fuel']=='NUC (Nuclear)']
-#df_loss_dict = pd.read_csv('df_dict.csv',header=None,index_col=0)
-df_loss_dict= np.load(os.path.join(data_allocation_dir, f'df_dict2_{NN}.npy'), allow_pickle='TRUE').item()
-#df_losses = pd.read_csv(os.path.join(data_allocation_dir, 'east_19_lostcap.csv'), header=0, index_col=0)
+# Outage-adjusted generator limits
+# The updated allocation/DataSetup workflow now prepares raw-generator-based
+# available-capacity limits before the wrapper runs:
+#   SimGenLimit[j, hour]        -> dispatchable thermal available capacity
+#   SimMustrunLimit[bus, hour]  -> nuclear/must-run available capacity
+# Therefore, do NOT read east*_lostcap_v4.csv or subtract category-level
+# lost capacity again in this wrapper.
 
-lostcap_file = data_allocation_dir / f'east{YEAR}_lostcap_v4.csv'
-
-if not lostcap_file.exists():
-    alt = data_allocation_dir / f'east{YEAR}_lostcap_v4'
-    if alt.exists():
-        lostcap_file = alt
-    else:
-        raise FileNotFoundError(
-            f"Could not find lost-cap file for YEAR={YEAR}. Checked:\n"
-            f"  {data_allocation_dir / f'east{YEAR}_lostcap_v4.csv'}\n"
-            f"  {data_allocation_dir / f'east{YEAR}_lostcap_v4'}"
-        )
-
-print(f"Using lost-cap file: {lostcap_file.name}")
-
-df_losses = pd.read_csv(lostcap_file, header=0, index_col=0)
-
-# Optional but useful sanity checks
-if len(df_losses) != 8760:
-    raise ValueError(
-        f"{lostcap_file.name} has {len(df_losses)} rows; expected 8760."
+if not (hasattr(instance, "SimGenLimit") and hasattr(instance, "HorizonGenLimit")):
+    raise RuntimeError(
+        "Model/data mismatch: EIC_simple.py/EIC_data.dat must define "
+        "SimGenLimit and HorizonGenLimit."
     )
 
-missing_loss_cols = [c for c in df_loss_dict.keys() if c not in df_losses.columns]
-if missing_loss_cols:
-    raise ValueError(
-        f"{lostcap_file.name} is missing outage columns used by df_loss_dict: "
-        f"{missing_loss_cols[:20]}"
+if not (hasattr(instance, "SimMustrunLimit") and hasattr(instance, "HorizonMustrunLimit")):
+    raise RuntimeError(
+        "Model/data mismatch: EIC_simple.py/EIC_data.dat must define "
+        "SimMustrunLimit and HorizonMustrunLimit."
     )
 
+print(
+    f"Using outage-adjusted SimGenLimit and SimMustrunLimit from EIC_data.dat "
+    f"for NN={NN}, YEAR={YEAR}."
+)
 
 #len(instance.InternalBuses)
 #len(instance.Exchange)
@@ -213,103 +221,30 @@ for day in range(win_start, win_start + win_len):
     #load fuel prices for thermal generators
         instance.FuelPrice[z] = instance.SimFuelPrice[z,day]
         
-    #Organizing outage data
-    #load gen and mustrun capacity time series data
+    # Organizing outage data
+    # Load already outage-adjusted gen and must-run capacity time series.
+    # These values were produced from raw/pre-reduction generator available
+    # capacity and written into EIC_data.dat by EICDataSetup.
     for z in instance.Outage:
+        base_cap = None
+        try:
+            if hasattr(instance, "maxcap") and z in instance.maxcap:
+                base_cap = float(pyo.value(instance.maxcap[z]))
+        except Exception:
+            base_cap = None
+
         for i in K:
-            instance.HorizonGenLimit[z,i] = instance.SimGenLimit[z,(day-1)*24+i]
-    
+            t_idx = (day - 1) * 24 + i
+            val = float(_safe_get_param(instance.SimGenLimit, (z, t_idx), default=0.0))
+            if base_cap is not None:
+                val = min(base_cap, val)
+            instance.HorizonGenLimit[z, i] = max(0.0, val)
+
     for z in instance.buses:
         for i in K:
-            t_idx = (day-1)*24 + i
-            if (z, t_idx) in instance.SimMustrunLimit:
-                instance.HorizonMustrunLimit[z, i] = instance.SimMustrunLimit[z, t_idx]
-            else:
-                instance.HorizonMustrunLimit[z, i] = 0.0
-    
-    # subtract real or historical capacity losses
-    for z in instance.Gas_below_50:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_below_50']/len(df_loss_dict['Gas_below_50']))
-    for z in instance.Gas_50_100:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_50_100']/len(df_loss_dict['Gas_50_100']))
-    for z in instance.Gas_100_200:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_100_200']/len(df_loss_dict['Gas_100_200']))  
-    for z in instance.Gas_200_300:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_200_300']/len(df_loss_dict['Gas_200_300'])) 
-    for z in instance.Gas_300_400:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_300_400']/len(df_loss_dict['Gas_300_400'])) 
-    for z in instance.Gas_400_600:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_400_600']/len(df_loss_dict['Gas_400_600'])) 
-    for z in instance.Gas_600_800:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_600_800']/len(df_loss_dict['Gas_600_800'])) 
-    for z in instance.Gas_800_1000:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_800_1000']/len(df_loss_dict['Gas_800_1000'])) 
-    for z in instance.Gas_ovr_1000:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_ovr_1000']/len(df_loss_dict['Gas_ovr_1000'])) 
-    for z in instance.Gas_All_n_0_100:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_All_n_0_100']/len(df_loss_dict['Gas_All_n_0_100']))
-    for z in instance.Gas_All_n_100_200:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_All_n_100_200']/len(df_loss_dict['Gas_All_n_100_200'])) 
-    for z in instance.Gas_All_n_ovr_200:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Gas_All_n_ovr_200']/len(df_loss_dict['Gas_All_n_ovr_200'])) 
-    for z in instance.Coal_below_50:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_below_50']/len(df_loss_dict['Coal_below_50'])) 
-    for z in instance.Coal_50_100:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_50_100']/len(df_loss_dict['Coal_50_100'])) 
-    for z in instance.Coal_100_200:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_100_200']/len(df_loss_dict['Coal_100_200'])) 
-    for z in instance.Coal_200_300:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_200_300']/len(df_loss_dict['Coal_200_300'])) 
-    for z in instance.Coal_300_400:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_300_400']/len(df_loss_dict['Coal_300_400'])) 
-    for z in instance.Coal_400_600:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_400_600']/len(df_loss_dict['Coal_400_600'])) 
-    for z in instance.Coal_600_800:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_600_800']/len(df_loss_dict['Coal_600_800'])) 
-    for z in instance.Coal_800_1000:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_800_1000']/len(df_loss_dict['Coal_800_1000'])) 
-    for z in instance.Coal_ovr_1000:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_ovr_1000']/len(df_loss_dict['Coal_ovr_1000'])) 
-    for z in instance.Coal_All_n_0_100:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_All_n_0_100']/len(df_loss_dict['Coal_All_n_0_100'])) 
-    for z in instance.Coal_All_n_100_200:
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_All_n_100_200']/len(df_loss_dict['Coal_All_n_100_200'])) 
-        for i in K:
-            instance.HorizonGenLimit[z,i] = max(0, instance.HorizonGenLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Coal_All_n_ovr_200']/len(df_loss_dict['Coal_All_n_ovr_200'])) 
-
-   #NEED TO ADD MUST RUN GENERATION OUTAGES     
-    #for z in instance.buses:
-    #    for i in K:
-    #        instance.HorizonMustrunLimit[z,i] = max(0,instance.HorizonMustrunLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Nuclear_ovr_1000']/len(nucs))   
-    for z in instance.Nuclear_ovr_1000:
-        for i in K:
-            instance.HorizonMustrunLimit[z,i] = max(0,instance.HorizonMustrunLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Nuclear_ovr_1000']/len(df_loss_dict['Nuclear_ovr_1000']))        
-    for z in instance.Nuclear_800_1000:
-        for i in K:
-            instance.HorizonMustrunLimit[z,i] = max(0,instance.HorizonMustrunLimit[z,i].value - df_losses.loc[(day-1)*24+i,'Nuclear_800_1000']/len(df_loss_dict['Nuclear_800_1000']))        
+            t_idx = (day - 1) * 24 + i
+            val = float(_safe_get_param(instance.SimMustrunLimit, (z, t_idx), default=0.0))
+            instance.HorizonMustrunLimit[z, i] = max(0.0, val)
 
 # =============================================================================
 #     

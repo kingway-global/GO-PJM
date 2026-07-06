@@ -21,7 +21,7 @@ model.Wind = Set()
 model.Thermal = model.Coal | model.Oil | model.Gas
 model.Generators = model.Thermal | model.Hydro | model.Solar | model.Wind
 model.Dispatchable = model.Hydro | model.Oil | model.Gas | model.Coal
-model.Outage = model.Coal | model.Gas
+model.Outage = model.Coal | model.Gas | model.Oil
 
 #outage sets
 model.Gas_below_50 = Set()
@@ -232,7 +232,7 @@ model.RampCon2 = Constraint(model.Thermal,model.ramp_periods,rule=Ramp2)
 #####=========== Capacity Constraints ============##########
 # Constraints for Max & Min Capacity of dispatchable resources
 
-#Max capacity constraint for outage set generators (coal, NG)
+#Max capacity constraint for outage-adjusted thermal generators: coal, gas, oil
 def MaxC(model,j,i):
     return model.mwh[j,i]  <= model.HorizonGenLimit[j,i] 
 model.MaxCap= Constraint(model.Outage,model.hh_periods,rule=MaxC)
