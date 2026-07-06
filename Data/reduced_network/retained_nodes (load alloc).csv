@@ -1,0 +1,20 @@
+NAME,N_Selected,Demand,Generation,Transmission,BA_ABBR
+"PJM Interconnection, LLC",350,127,112,111,PJM
+"Midcontinent Independent System Operator, Inc.",47,25,11,11,MISO
+Southwest Power Pool,19,15,2,2,SWPP
+"Southern Company Services, Inc. - Trans",16,9,4,3,SOCO
+Tennessee Valley Authority,11,8,2,1,TVA
+New York Independent System Operator,11,6,3,2,NYIS
+Florida Power & Light Co.,9,4,3,2,FPL
+Duke Energy Carolinas,8,4,2,2,DUK
+ISO New England,8,7,1,0,ISNE
+Duke Energy Progress East,4,3,1,0,CPLE
+Louisville Gas and Electric Company and Kentucky Utilities Company,3,3,0,0,LGEE
+"Duke Energy Florida, Inc.",3,2,1,0,FPC
+"Dominion Energy South Carolina, Inc.",2,2,0,0,SCEG
+South Carolina Public Service Authority,2,1,1,0,SC
+Tampa Electric Company,2,1,1,0,TEC
+"Associated Electric Cooperative, Inc.",2,2,0,0,AECI
+JEA,1,1,0,0,JEA
+PowerSouth Energy Cooperative,1,1,0,0,AEC
+Florida Municipal Power Pool,1,1,0,0,FMPP
